@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  mock_api:
+    build: ./mock_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./fake_users.csv:/app/../fake_users.csv:ro
+    environment:
+      - PYTHONUNBUFFERED=1
