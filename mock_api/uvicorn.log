@@ -1,0 +1,10 @@
+nohup: ignoring input
+INFO:     Started server process [12467]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:48318 - "GET /admin/mocks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43676 - "POST /admin/mocks HTTP/1.1" 201 Created
+INFO:     127.0.0.1:43690 - "GET /mocks/users-list HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46916 - "GET /mocks/users-list HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59384 - "GET /mocks/users-list HTTP/1.1" 404 Not Found

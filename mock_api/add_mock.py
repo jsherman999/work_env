@@ -34,16 +34,53 @@ def save_mappings(m):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Register a file-backed mock')
-    p.add_argument('--label', required=True, help='Label to register (served at /mocks/{label})')
-    p.add_argument('--src', required=True, help='Source file to copy into mock_data')
-    p.add_argument('--type', default='json', choices=['json', 'csv', 'raw'], help='Type of mock')
-    p.add_argument('--status', type=int, default=200, help='HTTP status code to return')
-    p.add_argument('--headers', default='{}', help='JSON string of headers to return')
-    p.add_argument('--content-type', default=None, help='Content-Type for raw responses')
-    p.add_argument('--overwrite', action='store_true', help='Overwrite existing mapping')
+
+    p = argparse.ArgumentParser(description='Manage file-backed mocks (add/list/delete)')
+    sub = p.add_subparsers(dest='cmd')
+
+    # add subcommand
+    add = sub.add_parser('add', help='Add a mapping by copying a file into mock_data')
+    add.add_argument('--label', required=True, help='Label to register (served at /mocks/{label})')
+    add.add_argument('--src', required=True, help='Source file to copy into mock_data')
+    add.add_argument('--type', default='json', choices=['json', 'csv', 'raw'], help='Type of mock')
+    add.add_argument('--status', type=int, default=200, help='HTTP status code to return')
+    add.add_argument('--headers', default='{}', help='JSON string of headers to return')
+    add.add_argument('--content-type', default=None, help='Content-Type for raw responses')
+    add.add_argument('--overwrite', action='store_true', help='Overwrite existing mapping')
+
+    # list subcommand
+    _ = sub.add_parser('list', help='List current mappings')
+
+    # delete subcommand
+    delete = sub.add_parser('delete', help='Delete a mapping and remove its file')
+    delete.add_argument('--label', required=True, help='Label to delete')
+
     args = p.parse_args()
 
+    mappings = load_mappings()
+
+    if args.cmd == 'list':
+        print(json.dumps(mappings, indent=2))
+        return
+
+    if args.cmd == 'delete':
+        lbl = args.label
+        if lbl not in mappings:
+            print('label not found')
+            raise SystemExit(2)
+        meta = mappings.pop(lbl)
+        save_mappings(mappings)
+        # try remove file
+        try:
+            pth = (HERE / meta.get('path')).resolve()
+            if pth.exists() and pth.parent == MOCK_DATA_DIR.resolve():
+                pth.unlink()
+        except Exception:
+            pass
+        print('deleted', lbl)
+        return
+
+    # default: add
     label = args.label
     src = Path(args.src)
     if not src.exists():
@@ -52,7 +89,6 @@ def main():
 
     MOCK_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    mappings = load_mappings()
     if label in mappings and not args.overwrite:
         print('Label already exists. Use --overwrite to replace.')
         raise SystemExit(3)

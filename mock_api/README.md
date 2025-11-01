@@ -191,4 +191,31 @@ The endpoint will return the content of the file with the HTTP status in the map
 
 If you need to replace an existing mapping use `--overwrite`.
 
+## Admin HTTP API
+
+If you prefer to register mocks at runtime over HTTP (no CLI), the mock server exposes a small admin API under `/admin/mocks`:
+
+- `GET /admin/mocks` — list current mappings (returns JSON object)
+- `POST /admin/mocks` — register a mapping via multipart form upload. Form fields:
+  - `label` (string) — label to register (required)
+  - `file` (file upload) — file to be copied into `mock_data/` (required)
+  - `type` (json|csv|raw) — response type (default: json)
+  - `status` (int) — HTTP status to return (default: 200)
+  - `headers` (JSON string) — optional response headers
+  - `content_type` (string) — optional content-type for `raw` responses
+
+  Example curl (register a JSON file):
+
+  ```bash
+  curl -sS -X POST \
+    -F 'label=users-list' \
+    -F 'file=@../fake_users.json' \
+    -F 'type=json' \
+    http://127.0.0.1:8000/admin/mocks | jq
+  ```
+
+- `DELETE /admin/mocks/{label}` — remove a mapping and its file (if stored under `mock_data/`).
+
+These endpoints are intentionally minimal and unauthenticated for dev/testing; add auth in front of the mock in CI or local env if needed.
+
 

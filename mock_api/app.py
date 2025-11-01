@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
-import os, time, random, json
+import os, time, random, json, base64
 from typing import List, Dict, Any
 from . import db
 
@@ -19,6 +19,15 @@ def load_mappings():
             return json.load(f)
     except Exception:
         return {}
+
+
+def save_mappings(mappings: dict):
+    try:
+        with open(MOCKS_JSON, 'w') as f:
+            json.dump(mappings, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def resolve_mock(label: str):
@@ -223,6 +232,98 @@ def serve_mock(label: str, delay_ms: int = Query(0)):
         # treat as raw/text/binary
         ctype = meta.get('content_type') or 'application/octet-stream'
         return FileResponse(path, status_code=status, media_type=ctype, headers=headers)
+
+
+@app.get('/admin/mocks')
+def admin_list_mocks():
+    """List registered mock mappings."""
+    return load_mappings()
+
+
+@app.post('/admin/mocks')
+def admin_register_mock(payload: Dict[str, Any]):
+    """Register a new mock via JSON body.
+
+    Expected JSON fields:
+      - label (str) required
+      - filename (str) optional, name to store under mock_data
+      - content (string) OR content_b64 (base64 string) required
+      - type (json|csv|raw) default json
+      - status (int) default 200
+      - headers (object) optional
+      - content_type (string) optional for raw
+    """
+    label = payload.get('label')
+    if not label:
+        raise HTTPException(status_code=400, detail='label required')
+    mappings = load_mappings()
+    if label in mappings:
+        raise HTTPException(status_code=409, detail='label exists; delete first or use another label')
+
+    fname = payload.get('filename') or f"{label}.bin"
+    c = payload.get('content')
+    cb64 = payload.get('content_b64')
+    if c is None and cb64 is None:
+        raise HTTPException(status_code=400, detail='content or content_b64 required')
+    if cb64 is not None:
+        try:
+            content = base64.b64decode(cb64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f'invalid base64: {e}')
+    else:
+        # treat content as UTF-8 text
+        content = str(c).encode('utf-8')
+
+    mtype = payload.get('type', 'json')
+    status = int(payload.get('status', 200))
+    headers = payload.get('headers') or {}
+    content_type = payload.get('content_type')
+
+    if mtype == 'json':
+        try:
+            json.loads(content.decode('utf-8'))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f'invalid json: {e}')
+
+    os.makedirs(MOCK_DATA_DIR, exist_ok=True)
+    dest_name = f"{label}__{os.path.basename(fname)}"
+    dest_path = os.path.join(MOCK_DATA_DIR, dest_name)
+    try:
+        with open(dest_path, 'wb') as fh:
+            fh.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'failed to write file: {e}')
+
+    mappings[label] = {
+        'path': os.path.join('mock_data', dest_name),
+        'type': mtype,
+        'status': status,
+        'headers': headers,
+    }
+    if content_type:
+        mappings[label]['content_type'] = content_type
+
+    if not save_mappings(mappings):
+        raise HTTPException(status_code=500, detail='failed to save mapping')
+
+    return JSONResponse(status_code=201, content={label: mappings[label]})
+
+
+@app.delete('/admin/mocks/{label}')
+def admin_delete_mock(label: str):
+    mappings = load_mappings()
+    if label not in mappings:
+        raise HTTPException(status_code=404, detail='not found')
+    meta = mappings.pop(label)
+    save_mappings(mappings)
+    # try to remove file if it exists in mock_data
+    try:
+        p = os.path.abspath(os.path.join(os.path.dirname(__file__), meta.get('path', '')))
+        if p.startswith(os.path.abspath(MOCK_DATA_DIR)) and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+    return JSONResponse(status_code=204, content={})
 
 
 @app.get("/users/{username}")
