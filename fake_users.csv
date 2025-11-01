@@ -1,0 +1,11 @@
+dn,cn,sAMAccountName,uidNumber,gidNumber,memberOf,mail,sn,givenName,telephoneNumber,accountExpires,lockoutTime,userAccountControl
+"CN=John Doe,OU=Users,DC=example,DC=com",John Doe,johndoe,1001,1001,"Linux Servers;Domain Users",johndoe@example.com,Doe,John,555-0101,9223372036854775807,0,512
+"CN=Alice Smith,OU=Users,DC=example,DC=com",Alice Smith,asmith,1002,1001,"Domain Users",asmith@example.com,Smith,Alice,555-0102,9223372036854775807,0,512
+"CN=Bruce Wayne,OU=Users,DC=example,DC=com",Bruce Wayne,bwayne,1003,1001,"Admins;Domain Users",bwayne@example.com,Wayne,Bruce,555-0103,9223372036854775807,0,512
+"CN=Carol White,OU=Users,DC=example,DC=com",Carol White,cwhite,1004,1001,"Domain Users",cwhite@example.com,White,Carol,555-0104,9223372036854775807,0,512
+"CN=David Jones,OU=Users,DC=example,DC=com",David Jones,djones,1005,1001,"Service Accounts;Domain Users",djones@example.com,Jones,David,555-0105,9223372036854775807,0,512
+"CN=Elena Miller,OU=Users,DC=example,DC=com",Elena Miller,emiller,1006,1001,"Domain Users",emiller@example.com,Miller,Elena,555-0106,9223372036854775807,0,512
+"CN=Fernando Garcia,OU=Users,DC=example,DC=com",Fernando Garcia,fgarcia,1007,1001,"Service Accounts;Domain Users",fgarcia@example.com,Garcia,Fernando,555-0107,9223372036854775807,0,512
+"CN=Gita Patel,OU=Users,DC=example,DC=com",Gita Patel,gpatel,1008,1001,"Linux Servers;Domain Users",gpatel@example.com,Patel,Gita,555-0108,9223372036854775807,0,512
+"CN=Hye Kim,OU=Users,DC=example,DC=com",Hye Kim,hkim,1009,1001,"Domain Users",hkim@example.com,Kim,Hye,555-0109,9223372036854775807,0,512
+"CN=Ian Lee,OU=Users,DC=example,DC=com",Ian Lee,ilee,1010,1001,"Domain Users",ilee@example.com,Lee,Ian,555-0110,9223372036854775807,0,512

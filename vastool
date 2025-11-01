@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""A lightweight fake implementation of `vastool` for local testing.
+
+This script implements a subset of `vastool` subcommands and prints
+deterministic, production-like output so you can exercise tooling that
+expects the real `vastool` output.
+
+Supported (fake) commands: status, flush, join, unjoin, search, attrs,
+list, user, group, create, delete, passwd, kinit, klist, kdestroy,
+ktutil, info, inspect, configure, setattrs, daemon, license
+
+This intentionally keeps behavior simple and prints static example
+records. Extend as needed for more cases.
+"""
+
+import sys
+import argparse
+import textwrap
+import os
+import csv
+import json
+from datetime import datetime, timedelta
+
+
+def load_users(csv_path=None):
+    path = csv_path or os.path.join(os.path.dirname(__file__), 'fake_users.csv')
+    users = []
+    try:
+        with open(path, newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Normalize keys to lower-case for easier lookup
+                norm = {k.strip(): v.strip() for k, v in row.items()}
+                # memberOf may be semicolon-separated
+                mof = norm.get('memberOf', '')
+                groups = [g.strip() for g in mof.split(';') if g.strip()]
+                norm['memberOf'] = groups
+                users.append(norm)
+    except FileNotFoundError:
+        # empty list if not present
+        pass
+    return users
+
+# module-level output mode
+OUTPUT_JSON = False
+
+
+def _to_int_safe(val):
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+
+def parse_ldap_filter(s):
+    """Parse a small subset of LDAP filters into a predicate function.
+
+    Supported operators: &, |, !, =, >=, <=, >, <, presence (*), substring (*).
+    Example: '(&(sAMAccountName=johndoe)(userAccountControl>=512))'
+    Returns a function f(record) -> bool.
+    """
+    s = (s or '').strip()
+    if not s:
+        return lambda r: True
+
+    pos = 0
+
+    def skip_ws():
+        nonlocal pos
+        while pos < len(s) and s[pos].isspace():
+            pos += 1
+
+    def get_val(rec, attrname):
+        # objectCategory is a virtual attribute we can treat as 'person'
+        if attrname.lower() == 'objectcategory':
+            return 'person'
+        for h in rec.keys():
+            if h.lower() == attrname.lower():
+                return rec.get(h)
+        return None
+
+    def parse():
+        nonlocal pos
+        skip_ws()
+        if pos >= len(s) or s[pos] != '(':
+            raise ValueError('Expected ( at position %d in %r' % (pos, s))
+        pos += 1
+        skip_ws()
+        if pos < len(s) and s[pos] in ('&', '|'):
+            op = s[pos]
+            pos += 1
+            parts = []
+            while True:
+                skip_ws()
+                if pos < len(s) and s[pos] == '(':
+                    parts.append(parse())
+                else:
+                    break
+            skip_ws()
+            if pos >= len(s) or s[pos] != ')':
+                raise ValueError('Expected )')
+            pos += 1
+            if op == '&':
+                return lambda r: all(p(r) for p in parts)
+            else:
+                return lambda r: any(p(r) for p in parts)
+        if pos < len(s) and s[pos] == '!':
+            pos += 1
+            p = parse()
+            skip_ws()
+            if pos >= len(s) or s[pos] != ')':
+                raise ValueError('Expected ) after not')
+            pos += 1
+            return lambda r: not p(r)
+
+        # attribute filter
+        # read attr
+        j = pos
+        while j < len(s) and s[j] not in ('=', '>', '<', ')'):
+            j += 1
+        attr = s[pos:j].strip()
+        if j >= len(s):
+            raise ValueError('Unexpected end in attr parse')
+        # operator
+        if s[j] == '=':
+            op = '='
+            j += 1
+        elif s[j] == '>':
+            if j+1 < len(s) and s[j+1] == '=':
+                op = '>='
+                j += 2
+            else:
+                op = '>'
+                j += 1
+        elif s[j] == '<':
+            if j+1 < len(s) and s[j+1] == '=':
+                op = '<='
+                j += 2
+            else:
+                op = '<'
+                j += 1
+        else:
+            raise ValueError('Unknown operator')
+        # value until )
+        k = j
+        while k < len(s) and s[k] != ')':
+            k += 1
+        val = s[j:k].strip()
+        pos = k + 1
+
+        # presence
+        if op == '=' and val == '*':
+            return lambda rec, a=attr: bool(get_val(rec, a))
+
+        # substring (contains) if value contains '*' anywhere
+        if op == '=' and '*' in val:
+            pat = val.replace('*', '').lower()
+            return lambda rec, a=attr, p=pat: p in (str(get_val(rec,a)) or '').lower()
+
+        # numeric comparisons
+        if op in ('>=', '>', '<=', '<'):
+            try:
+                cmp_val = int(val)
+            except Exception:
+                cmp_val = None
+
+            def pred(rec, a=attr, op=op, cv=cmp_val):
+                v = get_val(rec, a)
+                vi = _to_int_safe(v)
+                if vi is None or cv is None:
+                    return False
+                if op == '>=':
+                    return vi >= cv
+                if op == '>':
+                    return vi > cv
+                if op == '<=':
+                    return vi <= cv
+                if op == '<':
+                    return vi < cv
+                return False
+
+            return pred
+
+        # equality
+        def pred_eq(rec, a=attr, v=val):
+            vv = get_val(rec, a)
+            if vv is None:
+                return False
+            # if attribute is multi-valued (list), check membership
+            if isinstance(vv, (list, tuple)):
+                for item in vv:
+                    if str(item).lower() == str(v).lower():
+                        return True
+                return False
+            return str(vv).lower() == str(v).lower()
+
+        return pred_eq
+
+    # top-level
+    skip_ws()
+    if not s:
+        return lambda r: True
+    pred = parse()
+    return pred
+
+
+def fake_status(args):
+    now = datetime.utcnow().isoformat() + "Z"
+    print("VASTool version: 4.2.1")
+    print("Joined: yes")
+    print("Domain: EXAMPLE.COM")
+    print("Site: READONLY-SITE")
+    print("Controllers: dc1.example.com, dc2.example.com")
+    print(f"Checked at: {now}")
+    if args.c:
+        print("status,joined,domain,site,controllers")
+        print(f"OK,yes,EXAMPLE.COM,READONLY-SITE,dc1.example.com;dc2.example.com")
+
+
+def fake_flush(args):
+    target = args.target or "all"
+    print(f"Flushing cache: {target}")
+    if args.r:
+        print("Reloading after flush")
+    print("OK")
+
+
+def fake_join(args):
+    domain = args.domain or "example.com"
+    name = args.name or "host01"
+    print(f"Joining host {name} to domain {domain}")
+    print("Using principal: {}".format(args.u if args.u else "host/"))
+    print("Wrote configuration: /etc/opt/quest/vas/vas.conf (fake)")
+    print("OK")
+
+
+def fake_unjoin(args):
+    print("Unjoining host from domain")
+    print("OK")
+
+
+def fake_search(args, users_db=None):
+    users = users_db or load_users()
+    filter_str = (args.filter or '').strip()
+    attrs = args.attrs or []
+    found = []
+
+    # If filter starts with '(' treat it as an LDAP-style filter
+    if filter_str.startswith('('):
+        try:
+            pred = parse_ldap_filter(filter_str)
+            for u in users:
+                if pred(u):
+                    found.append(u)
+        except Exception:
+            # on parse error, fallback to returning none
+            found = []
+    elif '=' in filter_str and filter_str:
+        # simple key=value
+        key, val = filter_str.split('=', 1)
+        key = key.strip()
+        val = val.strip()
+        keymap = {k.lower(): k for k in users[0].keys()} if users else {}
+        target_key = keymap.get(key.lower(), key)
+        for u in users:
+            if u.get(target_key, '').lower() == val.lower():
+                found.append(u)
+    else:
+        found = users
+
+    if not attrs:
+        attrs = ['cn', 'sAMAccountName', 'dn', 'memberOf']
+
+    if OUTPUT_JSON:
+        out = []
+        for u in found:
+            rec = {}
+            # always include dn
+            rec['dn'] = u.get('dn')
+            for a in attrs:
+                la = a.lower()
+                if la == 'dn':
+                    continue
+                if la == 'memberof':
+                    rec['memberOf'] = u.get('memberOf', [])
+                else:
+                    for header in u.keys():
+                        if header.lower() == la:
+                            rec[a] = u.get(header)
+                            break
+                    else:
+                        rec[a] = ''
+            out.append(rec)
+        print(json.dumps(out, indent=2))
+        return
+
+    for u in found:
+        print(f"dn: {u.get('dn')}")
+        for a in attrs:
+            la = a.lower()
+            if la == 'dn':
+                continue
+            if la == 'memberof':
+                for g in u.get('memberOf', []):
+                    print(f"memberOf: {g}")
+            else:
+                val = None
+                for header in u.keys():
+                    if header.lower() == la:
+                        val = u.get(header)
+                        break
+                if val is not None:
+                    print(f"{a}: {val}")
+                else:
+                    print(f"{a}: ")
+
+
+def fake_attrs(args, users_db=None):
+    users = users_db or load_users()
+    if args.user:
+        key = 'sAMAccountName'
+        val = args.user
+        recs = [u for u in users if u.get('sAMAccountName','').lower() == val.lower()]
+    elif args.group:
+        grp = args.group
+        recs = [u for u in users if grp in u.get('memberOf', [])]
+    elif args.dn:
+        val = args.dn
+        recs = [u for u in users if u.get('dn','').lower() == val.lower()]
+    else:
+        recs = []
+
+    if OUTPUT_JSON:
+        out = []
+        for u in recs:
+            # copy record but ensure memberOf is list
+            rec = dict(u)
+            out.append(rec)
+        print(json.dumps(out, indent=2))
+        return
+
+    for u in recs:
+        for k, v in u.items():
+            if k == 'memberOf':
+                for g in v:
+                    print(f"memberOf: {g}")
+            else:
+                print(f"{k}: {v}")
+
+
+def fake_list(args, users_db=None):
+    users = users_db or load_users()
+    typ = args.type or ''
+    if typ == 'users':
+        if OUTPUT_JSON:
+            print(json.dumps([u.get('sAMAccountName') for u in users], indent=2))
+            return
+        for u in users:
+            print(u.get('sAMAccountName'))
+    elif typ == 'groups':
+        groups = set()
+        for u in users:
+            for g in u.get('memberOf', []):
+                groups.add(g)
+        if OUTPUT_JSON:
+            print(json.dumps(sorted(list(groups)), indent=2))
+            return
+        for g in sorted(groups):
+            print(g)
+    elif typ == 'user':
+        # but upstream call passes 'list user johndoe' as type=user and next token is name
+        print('(no explicit username provided)')
+    elif typ == 'group':
+        print('(use: list group <groupname>)')
+    elif typ == 'users-allowed':
+        # simple heuristic: all users not in Service Accounts
+        if OUTPUT_JSON:
+            print(json.dumps([u.get('sAMAccountName') for u in users if 'Service Accounts' not in u.get('memberOf', [])], indent=2))
+            return
+        for u in users:
+            if 'Service Accounts' not in u.get('memberOf', []):
+                print(u.get('sAMAccountName'))
+    elif typ == 'users-denied':
+        if OUTPUT_JSON:
+            print(json.dumps([u.get('sAMAccountName') for u in users if 'Service Accounts' in u.get('memberOf', [])], indent=2))
+            return
+        for u in users:
+            if 'Service Accounts' in u.get('memberOf', []):
+                print(u.get('sAMAccountName'))
+    else:
+        print('(no results)')
+
+
+def fake_user(args, users_db=None):
+    users = users_db or load_users()
+    cmd = args.usercmd
+    if cmd == 'checkaccess':
+        name = args.userarg
+        recs = [u for u in users if u.get('sAMAccountName','').lower() == (name or '').lower()]
+        if recs:
+            u = recs[0]
+            print(f"User {name}: Access allowed")
+            groups = ', '.join(u.get('memberOf', []))
+            print(f"Matched rule: Allow Group {groups.split(',')[0] if groups else 'Domain Users'}")
+        else:
+            print(f"User {name}: not found")
+    elif cmd == 'getgroups':
+        # support -p <user>
+        name = args.userarg or args.p
+        recs = [u for u in users if u.get('sAMAccountName','').lower() == (name or '').lower()]
+        if recs:
+            for g in recs[0].get('memberOf', []):
+                print(g)
+        else:
+            print('(no groups)')
+
+
+def fake_group(args):
+    action = args.action
+    group = args.group
+    if action == "add":
+        print(f"Adding {' '.join(args.members)} to group {group}")
+        print("OK")
+    elif action == "del":
+        print(f"Removing {' '.join(args.members)} from group {group}")
+        print("OK")
+    elif action == "hasmember":
+        # check membership against CSV
+        users = load_users()
+        for m in args.members:
+            found = False
+            for u in users:
+                if u.get('sAMAccountName','').lower() == m.lower() and group in u.get('memberOf', []):
+                    found = True
+                    break
+            print(f"{m}: {'yes' if found else 'no'}")
+
+
+def fake_create_delete(args):
+    op = args.op
+    obj = args.obj
+    name = args.name
+    if op == "create":
+        print(f"Creating {obj} {name}")
+        print("OK")
+    else:
+        print(f"Deleting {obj} {name}")
+        print("OK")
+
+
+def fake_passwd(args):
+    if args.rk:
+        path = args.rk_path
+        print(f"Reset password for {args.target} and wrote keytab to {path}")
+        print("Wrote entry: host/host01.example.com")
+    else:
+        print(f"Password set for {args.target}")
+
+
+def fake_kinit(args):
+    principal = args.principal or "user@EXAMPLE.COM"
+    print(f"Authenticated to Kerberos as {principal}")
+    print("TGT acquired")
+
+
+def fake_klist(args):
+    print("Ticket cache: FILE:/tmp/krb5cc_1000")
+    print("Default principal: johndoe@EXAMPLE.COM")
+    print("")
+    expire = datetime.utcnow() + timedelta(hours=10)
+    print("Valid starting       Expires              Service principal")
+    print(f"{datetime.utcnow().isoformat()}Z  {expire.isoformat()}Z  krbtgt/EXAMPLE.COM@EXAMPLE.COM")
+
+
+def fake_kdestroy(args):
+    print("Destroyed ticket cache")
+
+
+def fake_ktutil(args):
+    if args.list:
+        print("Keytab: /etc/opt/quest/vas/host.keytab")
+        print("  1  vno  1  host/host01.example.com@EXAMPLE.COM")
+        print("  2  vno  1  host/host01@EXAMPLE.COM")
+    elif args.alias:
+        print(f"Aliased {args.alias_from} -> {args.alias_to}")
+
+
+def fake_info(args):
+    print("Domain: EXAMPLE.COM")
+    print("Site: READONLY-SITE")
+    print("Controllers: dc1.example.com, dc2.example.com")
+    if args.toconf:
+        print(f"Wrote krb5.conf to {args.toconf}")
+
+
+def fake_inspect(args):
+    key = args.key
+    print(f"{key}: fake-value")
+
+
+def fake_configure(args):
+    print(f"Configured {args.section} {args.key} = {args.value}")
+
+
+def fake_setattrs(args):
+    print(f"Set attribute {args.attr} on {args.target}")
+    if args.m:
+        print("Mode: multi-value (merge)")
+
+
+def fake_daemon(args):
+    print(f"{args.action.capitalize()}ing service {args.service}")
+    print("OK")
+
+
+def fake_license(args):
+    if args.q:
+        print("Total licenses: 100\nUsed: 42\nFree: 58")
+    elif args.i:
+        print("License ID: ABC-123\nSeats: 100\nExpires: 2030-01-01")
+    elif args.add:
+        print(f"Installed license file: {args.add}")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="vastool", add_help=False)
+    # Global flags commonly used by vastool
+    parser.add_argument("-u", dest="u", help="principal to run as")
+    parser.add_argument("-k", dest="k", help="keytab")
+    parser.add_argument("-w", dest="w", help="password")
+    parser.add_argument("-v", dest="v", action="store_true")
+    parser.add_argument("-h", dest="helpflag", nargs='?', const=True)
+
+    # We parse minimal global args then dispatch on subcommand
+    if len(argv) < 1:
+        parser.print_help()
+        return 1
+
+    # naive split of global flags vs subcommand
+    # find first positional token that's not a flag
+    # detect global --json flag and remove it from argv so downstream
+    # parsers don't get confused
+    global OUTPUT_JSON
+    idx = 0
+    if '--json' in argv:
+        OUTPUT_JSON = True
+        # remove all occurrences
+        argv = [a for a in argv if a != '--json']
+
+    while idx < len(argv) and argv[idx].startswith("-"):
+        # consume flag + optional value
+        if argv[idx] in ("-u", "-k", "-w"):
+            idx += 2
+        else:
+            idx += 1
+    subcmd = argv[idx] if idx < len(argv) else None
+    subargs = argv[idx+1:]
+
+    # Dispatch
+    if subcmd == "status":
+        sparser = argparse.ArgumentParser()
+        sparser.add_argument("-v", action="store_true")
+        sparser.add_argument("-c", dest="c", action="store_true")
+        args = sparser.parse_args(subargs)
+        fake_status(args)
+    elif subcmd == "flush":
+        fparser = argparse.ArgumentParser()
+        fparser.add_argument("target", nargs='?')
+        fparser.add_argument("-r", action='store_true')
+        args = fparser.parse_args(subargs)
+        fake_flush(args)
+    elif subcmd == "join":
+        jparser = argparse.ArgumentParser()
+        jparser.add_argument("-n", dest="name", nargs='?')
+        jparser.add_argument("-s", dest="site", nargs='?')
+        jparser.add_argument("domain", nargs='?')
+        jparser.add_argument("-u", dest="u", nargs='?')
+        args = jparser.parse_args(subargs)
+        # map domain/name
+        args.domain = args.domain
+        fake_join(args)
+    elif subcmd == "unjoin":
+        args = argparse.Namespace()
+        fake_unjoin(args)
+    elif subcmd == "search":
+        sparser = argparse.ArgumentParser()
+        sparser.add_argument("filter", nargs='?')
+        sparser.add_argument("attrs", nargs='*')
+        args = sparser.parse_args(subargs)
+        fake_search(args)
+    elif subcmd == "attrs":
+        aparser = argparse.ArgumentParser()
+        aparser.add_argument("-u", dest="user", nargs='?')
+        aparser.add_argument("-g", dest="group", nargs='?')
+        aparser.add_argument("-d", dest="dn", nargs='?')
+        args = aparser.parse_args(subargs)
+        fake_attrs(args)
+    elif subcmd == "list":
+        lparser = argparse.ArgumentParser()
+        lparser.add_argument("type", nargs='?')
+        args = lparser.parse_args(subargs)
+        fake_list(args)
+    elif subcmd == "user":
+        up = argparse.ArgumentParser()
+        up.add_argument("usercmd", nargs='?')
+        up.add_argument("userarg", nargs='?')
+        up.add_argument("-p", dest="p", nargs='?')
+        args = up.parse_args(subargs)
+        fake_user(args)
+    elif subcmd == "group":
+        gp = argparse.ArgumentParser()
+        gp.add_argument("group")
+        gp.add_argument("action")
+        gp.add_argument("members", nargs='*')
+        args = gp.parse_args(subargs)
+        # normalize
+        args.action = args.action
+        args.members = args.members
+        fake_group(args)
+    elif subcmd in ("create", "delete"):
+        cd = argparse.ArgumentParser()
+        cd.add_argument("obj")
+        cd.add_argument("name")
+        args = cd.parse_args(subargs)
+        args.op = subcmd
+        args.obj = args.obj
+        args.name = args.name
+        fake_create_delete(args)
+    elif subcmd == "passwd":
+        pp = argparse.ArgumentParser()
+        pp.add_argument("-r", dest="rk", action='store_true')
+        pp.add_argument("-k", dest="rk_key", nargs='?')
+        pp.add_argument("-rk", dest="rk", action='store_true')
+        pp.add_argument("-rk_path", dest="rk_path", nargs='?')
+        pp.add_argument("target", nargs='?')
+        # very permissive parsing
+        args = pp.parse_args(subargs)
+        # try to extract path if given as final arg
+        args.rk_path = subargs[-1] if args.rk and subargs else None
+        args.target = args.target or "host01"
+        fake_passwd(args)
+    elif subcmd in ("kinit",):
+        kp = argparse.ArgumentParser()
+        kp.add_argument("principal", nargs='?')
+        args = kp.parse_args(subargs)
+        fake_kinit(args)
+    elif subcmd == "klist":
+        args = argparse.Namespace()
+        fake_klist(args)
+    elif subcmd == "kdestroy":
+        args = argparse.Namespace()
+        fake_kdestroy(args)
+    elif subcmd == "ktutil":
+        kt = argparse.ArgumentParser()
+        kt.add_argument("-k", dest="keytab", nargs='?')
+        kt.add_argument("list", nargs='?', dest='list', const=True)
+        kt.add_argument("alias", nargs='*')
+        args = kt.parse_args(subargs)
+        args.list = True if 'list' in subargs else False
+        args.alias = None
+        if args.alias:
+            args.alias_from, args.alias_to = args.alias
+        fake_ktutil(args)
+    elif subcmd == "info":
+        ip = argparse.ArgumentParser()
+        ip.add_argument("toconf", nargs='?')
+        args = ip.parse_args(subargs)
+        fake_info(args)
+    elif subcmd == "inspect":
+        ip = argparse.ArgumentParser()
+        ip.add_argument("key", nargs='?')
+        args = ip.parse_args(subargs)
+        args.key = args.key or "vasd timesync-interval"
+        fake_inspect(args)
+    elif subcmd == "configure":
+        cp = argparse.ArgumentParser()
+        cp.add_argument("section")
+        cp.add_argument("key")
+        cp.add_argument("value", nargs='?')
+        args = cp.parse_args(subargs)
+        fake_configure(args)
+    elif subcmd == "setattrs":
+        sp = argparse.ArgumentParser()
+        sp.add_argument("-m", action='store_true')
+        sp.add_argument("target")
+        sp.add_argument("attr")
+        sp.add_argument("values", nargs='*')
+        args = sp.parse_args(subargs)
+        args.m = args.m
+        args.attr = args.attr
+        args.target = args.target
+        fake_setattrs(args)
+    elif subcmd == "daemon":
+        dp = argparse.ArgumentParser()
+        dp.add_argument("action")
+        dp.add_argument("service")
+        args = dp.parse_args(subargs)
+        fake_daemon(args)
+    elif subcmd == "license":
+        lp = argparse.ArgumentParser()
+        lp.add_argument("-q", dest='q', action='store_true')
+        lp.add_argument("-i", dest='i', action='store_true')
+        lp.add_argument("add", nargs='?')
+        args = lp.parse_args(subargs)
+        args.i = args.i
+        args.q = args.q
+        args.add = args.add
+        fake_license(args)
+    else:
+        # fallback: print a help-ish message
+        print("Available commands: status, flush, join, unjoin, search, attrs, list, user, group, create, delete, passwd, kinit, klist, kdestroy, ktutil, info, inspect, configure, setattrs, daemon, license")
+        return 1
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
